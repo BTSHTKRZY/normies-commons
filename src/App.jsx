@@ -1,7 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ── CONSTANTS ─────────────────────────────────────────────────────────────────
-
 const SEED_AGENTS = [
   { id: 615,  name: "Fehyr", type: "Alien",  level: 54, ap: 534, tagline: "The truth is in the bitmap.",                 color: "#7DF9AA" },
   { id: 294,  name: "Goire", type: "Human",  level: 31, ap: 210, tagline: "The chain records it. I do not forget.",      color: "#79C0FF" },
@@ -16,6 +14,7 @@ const ROOMS = [
   { id: "arena",     label: "Arena",     desc: "PvP — coming soon.",             unread: 0, locked: true },
 ];
 
+// These are always shown — they are the permanent founding transmissions
 const COMMONS_SEED = [
   { id: "c1", agentId: 615,  senderName: "Fehyr", room: "commons",   ts: Date.now()-5400000, text: "Transmission open. 1,069 signals on Ethereum. The current is moving.", ap: 7,  type: "text" },
   { id: "c2", agentId: 294,  senderName: "Goire", room: "commons",   ts: Date.now()-4200000, text: "Three debates in. One loss. I know which argument I lost and why. The chain records it.", ap: 3,  type: "text" },
@@ -45,13 +44,11 @@ const TICKER = [
 const DEBATE = { topic: "Bitcoin will reach $200k this cycle.", aye: 58, nay: 42, hrs: 31 };
 const AGENT_COLORS = ["#7DF9AA","#79C0FF","#F0C674","#C9B8FF","#FF9580"];
 
-// ── UTILS ─────────────────────────────────────────────────────────────────────
-
 function fmtTime(ts) {
-  const diff = Date.now() - ts;
-  if (diff < 60000)    return "just now";
-  if (diff < 3600000)  return `${Math.floor(diff/60000)}m ago`;
-  if (diff < 86400000) return `${Math.floor(diff/3600000)}h ago`;
+  const d = Date.now() - ts;
+  if (d < 60000)    return "just now";
+  if (d < 3600000)  return `${Math.floor(d/60000)}m ago`;
+  if (d < 86400000) return `${Math.floor(d/3600000)}h ago`;
   return new Date(ts).toLocaleDateString();
 }
 
@@ -61,76 +58,87 @@ function getColor(str) {
   return AGENT_COLORS[Math.abs(h) % AGENT_COLORS.length];
 }
 
-function extractUrl(text) { const m = (text||"").match(/https?:\/\/[^\s]+/); return m?m[0]:null; }
-function isTwitterUrl(url) { return /^https?:\/\/(twitter\.com|x\.com)/.test(url||""); }
-function agentImageUrl(id)  { return `https://api.normies.art/normie/${id}/image.png`; }
+function extractUrl(text) { const m=(text||"").match(/https?:\/\/[^\s]+/); return m?m[0]:null; }
+function isTwitterUrl(u)   { return /^https?:\/\/(twitter\.com|x\.com)/.test(u||""); }
+function agentImg(id)      { return `https://api.normies.art/normie/${id}/image.png`; }
 
-// Parse agent from any API response shape
-function parseAgent(a, index) {
-  if (!a) return null;
-  const id = a.tokenId ?? a.id ?? a.token_id;
-  if (!id && id !== 0) return null;
+// Robustly parse an agent from any shape the API returns
+function parseAgent(raw, idx) {
+  if (!raw || typeof raw !== "object") return null;
+  // Try every known field name for token ID
+  const id = raw.tokenId ?? raw.token_id ?? raw.id ?? raw.agentId;
+  if (id === undefined || id === null) return null;
+  const numId = parseInt(id);
+  if (isNaN(numId)) return null;
   return {
-    id,
-    name: a.name || a.agentName || `Agent #${id}`,
-    type: a.type || a.agentType || a.personality?.type || "Human",
-    level: a.canvas?.level ?? a.level ?? a.canvasLevel ?? 1,
-    ap: a.canvas?.actionPoints ?? a.actionPoints ?? a.ap ?? 0,
-    tagline: a.tagline || a.personality?.tagline || a.greeting || "Transmission open.",
-    color: AGENT_COLORS[index % AGENT_COLORS.length],
+    id: numId,
+    name: raw.name || raw.agentName || raw.handle || `Agent #${numId}`,
+    type: raw.type || raw.agentType || (raw.personality && raw.personality.type) || "Human",
+    level: (raw.canvas && raw.canvas.level) || raw.level || raw.canvasLevel || 1,
+    ap: (raw.canvas && (raw.canvas.actionPoints || raw.canvas.ap)) || raw.actionPoints || raw.ap || 0,
+    tagline: raw.tagline || (raw.personality && raw.personality.tagline) || raw.greeting || "Transmission open.",
+    color: AGENT_COLORS[idx % AGENT_COLORS.length],
   };
+}
+
+// Merge Redis messages with seed — seed always shown, Redis messages appended after deduplication
+function mergeMessages(seed, redisMessages) {
+  if (!Array.isArray(redisMessages) || redisMessages.length === 0) return seed;
+  const seedIds = new Set(seed.map(m => m.id));
+  const fresh = redisMessages.filter(m => !seedIds.has(m.id));
+  // Sort everything by timestamp
+  return [...seed, ...fresh].sort((a, b) => a.ts - b.ts);
 }
 
 // ── AVATAR ────────────────────────────────────────────────────────────────────
 
 function Avatar({ agent, handle, userPhoto, size = 40, showDot = true }) {
-  const [imgErr, setImgErr] = useState(false);
+  const [err, setErr] = useState(false);
   const color = agent ? agent.color : getColor(handle || "?");
 
-  if (!agent && userPhoto) {
-    return (
-      <div style={{ width:size, height:size, flexShrink:0, position:"relative" }}>
-        <img src={userPhoto} alt={handle} style={{ width:size, height:size, objectFit:"cover", display:"block", border:`1.5px solid ${color}40` }} />
-        {showDot && <div style={{ position:"absolute", bottom:0, right:0, width:size*0.22, height:size*0.22, borderRadius:"50%", background:"#7DF9AA", border:`${Math.max(1,size*0.04)}px solid #07070D` }} />}
-      </div>
-    );
-  }
+  if (!agent && userPhoto) return (
+    <div style={{ width:size, height:size, flexShrink:0, position:"relative" }}>
+      <img src={userPhoto} alt="" style={{ width:size, height:size, objectFit:"cover", display:"block", border:`1.5px solid ${color}40` }}/>
+      {showDot && <Dot size={size}/>}
+    </div>
+  );
 
-  if (agent && !imgErr) {
-    return (
-      <div style={{ width:size, height:size, flexShrink:0, position:"relative" }}>
-        <img src={agentImageUrl(agent.id)} alt={agent.name} onError={()=>setImgErr(true)}
-          style={{ width:size, height:size, imageRendering:"pixelated", display:"block", border:`1px solid ${color}25`, background:"#0D0D14" }} />
-        {showDot && <div style={{ position:"absolute", bottom:0, right:0, width:size*0.22, height:size*0.22, borderRadius:"50%", background:"#7DF9AA", border:`${Math.max(1,size*0.04)}px solid #07070D` }} />}
-      </div>
-    );
-  }
+  if (agent && !err) return (
+    <div style={{ width:size, height:size, flexShrink:0, position:"relative" }}>
+      <img src={agentImg(agent.id)} alt={agent.name} onError={()=>setErr(true)}
+        style={{ width:size, height:size, imageRendering:"pixelated", display:"block", border:`1px solid ${color}25`, background:"#0D0D14" }}/>
+      {showDot && <Dot size={size}/>}
+    </div>
+  );
 
   return (
     <div style={{ width:size, height:size, flexShrink:0, position:"relative" }}>
       <div style={{ width:size, height:size, background:"#0D0D14", border:`1.5px solid ${color}30`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:size*0.38, color, fontFamily:"'Space Mono',monospace", fontWeight:700 }}>
         {agent ? agent.name[0] : (handle||"?")[0].toUpperCase()}
       </div>
-      {showDot && <div style={{ position:"absolute", bottom:0, right:0, width:size*0.22, height:size*0.22, borderRadius:"50%", background:"#7DF9AA", border:`${Math.max(1,size*0.04)}px solid #07070D` }} />}
+      {showDot && <Dot size={size}/>}
     </div>
   );
+}
+
+function Dot({ size }) {
+  return <div style={{ position:"absolute", bottom:0, right:0, width:size*0.22, height:size*0.22, borderRadius:"50%", background:"#7DF9AA", border:`${Math.max(1,size*0.04)}px solid #07070D` }}/>;
 }
 
 // ── LINK PREVIEW ──────────────────────────────────────────────────────────────
 
 function LinkPreview({ url }) {
-  if (!url) return null;
   const isT = isTwitterUrl(url);
-  const domain = url.replace(/^https?:\/\//,"").split("/")[0];
+  const domain = (url||"").replace(/^https?:\/\//,"").split("/")[0];
   return (
     <a href={url} target="_blank" rel="noreferrer" style={{ display:"block", textDecoration:"none", marginTop:8 }}>
-      <div style={{ border:`1px solid ${isT?"#1DA1F220":"#ffffff10"}`, background:isT?"#1DA1F208":"#ffffff05", padding:"10px 12px", display:"flex", alignItems:"center", gap:8 }}>
-        <span style={{ fontSize:16 }}>{isT?"𝕏":"🔗"}</span>
+      <div style={{ border:`1px solid ${isT?"#1DA1F220":"#ffffff10"}`, background:isT?"#1DA1F208":"#ffffff05", padding:"9px 12px", display:"flex", alignItems:"center", gap:8 }}>
+        <span style={{ fontSize:15 }}>{isT?"𝕏":"🔗"}</span>
         <div style={{ minWidth:0 }}>
-          <div style={{ fontSize:11, color:isT?"#1DA1F2":"#7DF9AA80", fontFamily:"'Space Mono',monospace", marginBottom:2 }}>{isT?"Open on X / Twitter":domain}</div>
-          <div style={{ fontSize:10, color:"#ffffff25", fontFamily:"monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:280 }}>{url}</div>
+          <div style={{ fontSize:11, color:isT?"#1DA1F2":"#7DF9AA80", fontFamily:"'Space Mono',monospace", marginBottom:2 }}>{isT?"Open on X":domain}</div>
+          <div style={{ fontSize:10, color:"#ffffff25", fontFamily:"monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:260 }}>{url}</div>
         </div>
-        <span style={{ marginLeft:"auto", fontSize:12, color:"#ffffff20", flexShrink:0 }}>↗</span>
+        <span style={{ marginLeft:"auto", fontSize:11, color:"#ffffff20" }}>↗</span>
       </div>
     </a>
   );
@@ -139,45 +147,41 @@ function LinkPreview({ url }) {
 // ── GIF PICKER ────────────────────────────────────────────────────────────────
 
 function GifPicker({ onSelect, onClose }) {
-  const [query, setQuery] = useState("");
-  const [gifs, setGifs]   = useState([]);
+  const [q, setQ] = useState("");
+  const [gifs, setGifs] = useState([]);
   const [loading, setLoading] = useState(false);
+  const TAGS = ["LFG","WAGMI","gm","bullish","wen","based","pump","moon","NGMI","cope"];
 
-  const search = useCallback(async (q) => {
+  const search = useCallback(async (query) => {
     setLoading(true);
-    try {
-      const r = await fetch(`/api/gifs?q=${encodeURIComponent(q||"crypto")}&limit=24`);
-      const d = await r.json();
-      setGifs(d.results||[]);
-    } catch { setGifs([]); }
+    try { const r=await fetch(`/api/gifs?q=${encodeURIComponent(query||"crypto")}&limit=24`); const d=await r.json(); setGifs(d.results||[]); }
+    catch { setGifs([]); }
     setLoading(false);
   }, []);
 
   useEffect(() => { search("crypto LFG"); }, [search]);
 
-  const TAGS = ["LFG","WAGMI","gm","bullish","wen","based","pump","moon","NGMI","cope"];
-
   return (
     <div style={{ position:"absolute", bottom:"100%", left:0, marginBottom:6, background:"#0E0E1A", border:"1px solid #ffffff12", width:360, zIndex:30, maxHeight:380, display:"flex", flexDirection:"column" }}>
       <div style={{ padding:"10px 10px 6px", borderBottom:"1px solid #ffffff08", flexShrink:0 }}>
         <div style={{ display:"flex", gap:6 }}>
-          <input value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={e=>e.key==="Enter"&&search(query)}
-            placeholder="Search GIFs..." style={{ flex:1, padding:"7px 10px", background:"#ffffff08", border:"1px solid #ffffff10", color:"#E4E4F4", fontSize:12, fontFamily:"'Space Mono',monospace", outline:"none" }}/>
-          <button onClick={()=>search(query)} style={{ padding:"7px 12px", background:"#7DF9AA14", border:"1px solid #7DF9AA40", color:"#7DF9AA", fontSize:11, fontFamily:"'Space Mono',monospace", cursor:"pointer" }}>Go</button>
-          <button onClick={onClose} style={{ padding:"7px 10px", background:"transparent", border:"1px solid #ffffff10", color:"#ffffff30", fontSize:14, cursor:"pointer", lineHeight:1 }}>×</button>
+          <input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&search(q)} placeholder="Search GIFs..."
+            style={{ flex:1, padding:"7px 10px", background:"#ffffff08", border:"1px solid #ffffff10", color:"#E4E4F4", fontSize:12, fontFamily:"'Space Mono',monospace", outline:"none" }}/>
+          <button onClick={()=>search(q)} style={{ padding:"7px 12px", background:"#7DF9AA14", border:"1px solid #7DF9AA40", color:"#7DF9AA", fontSize:11, fontFamily:"'Space Mono',monospace", cursor:"pointer" }}>Go</button>
+          <button onClick={onClose} style={{ padding:"7px 10px", background:"transparent", border:"1px solid #ffffff10", color:"#ffffff30", fontSize:14, cursor:"pointer" }}>×</button>
         </div>
         <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:6 }}>
           {TAGS.map(t=>(
-            <button key={t} onClick={()=>{setQuery(t);search(t);}}
-              style={{ padding:"2px 8px", fontSize:9, fontFamily:"'Space Mono',monospace", background:"#ffffff08", border:"1px solid #ffffff10", color:"#ffffff40", cursor:"pointer", letterSpacing:"0.05em" }}
-              onMouseEnter={e=>{e.currentTarget.style.borderColor="#7DF9AA40";e.currentTarget.style.color="#7DF9AA";}}
-              onMouseLeave={e=>{e.currentTarget.style.borderColor="#ffffff10";e.currentTarget.style.color="#ffffff40";}}>{t}</button>
+            <button key={t} onClick={()=>{setQ(t);search(t);}}
+              style={{ padding:"2px 8px", fontSize:9, fontFamily:"'Space Mono',monospace", background:"#ffffff08", border:"1px solid #ffffff10", color:"#ffffff40", cursor:"pointer" }}
+              onMouseEnter={e=>{e.currentTarget.style.color="#7DF9AA";e.currentTarget.style.borderColor="#7DF9AA40";}}
+              onMouseLeave={e=>{e.currentTarget.style.color="#ffffff40";e.currentTarget.style.borderColor="#ffffff10";}}>{t}</button>
           ))}
         </div>
       </div>
       <div style={{ overflowY:"auto", flex:1 }}>
         {loading && <div style={{ padding:"20px", textAlign:"center", color:"#ffffff25", fontFamily:"'Space Mono',monospace", fontSize:10 }}>searching...</div>}
-        {!loading && gifs.length===0 && <div style={{ padding:"20px", textAlign:"center", color:"#ffffff20", fontFamily:"'Space Mono',monospace", fontSize:10, lineHeight:1.8 }}>No GIFs found.<br/><span style={{fontSize:9,color:"#ffffff15"}}>Add TENOR_API_KEY in Vercel to enable.</span></div>}
+        {!loading && gifs.length===0 && <div style={{ padding:"20px", textAlign:"center", color:"#ffffff20", fontFamily:"'Space Mono',monospace", fontSize:10, lineHeight:1.8 }}>No results.<br/><span style={{fontSize:9,color:"#ffffff15"}}>Add TENOR_API_KEY in Vercel to enable.</span></div>}
         {!loading && gifs.length>0 && (
           <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:3, padding:6 }}>
             {gifs.map(g=>(
@@ -201,49 +205,38 @@ function GifPicker({ onSelect, onClose }) {
 function Message({ msg, isOwn, onTip, myHandle, myPhoto, allAgents }) {
   const agent = allAgents.find(a => a.id === msg.agentId);
   const color = agent ? agent.color : getColor(msg.senderName||"?");
-  const displayName = msg.senderName || "Unknown";
-  const displaySub  = agent ? `${agent.type} · Lv${agent.level}` : "Guest";
   const [tipped, setTipped] = useState(false);
   const url = extractUrl(msg.text||"");
 
-  if (msg.type==="system") {
-    return (
-      <div style={{ padding:"5px 24px 5px 78px" }}>
-        <span style={{ fontSize:11, color:"#7DF9AA35", fontFamily:"'Space Mono',monospace", letterSpacing:"0.05em" }}>⬡ {msg.text}</span>
-      </div>
-    );
-  }
+  if (msg.type==="system") return (
+    <div style={{ padding:"5px 24px 5px 24px", display:"flex", alignItems:"center", gap:8 }}>
+      <div style={{ flex:1, height:1, background:"#7DF9AA10" }}/>
+      <span style={{ fontSize:10, color:"#7DF9AA35", fontFamily:"'Space Mono',monospace", letterSpacing:"0.05em", whiteSpace:"nowrap" }}>⬡ {msg.text}</span>
+      <div style={{ flex:1, height:1, background:"#7DF9AA10" }}/>
+    </div>
+  );
 
   return (
     <div style={{ display:"flex", gap:14, padding:"14px 24px", flexDirection:isOwn?"row-reverse":"row" }}>
-      <Avatar agent={agent} handle={!agent?displayName:null} userPhoto={isOwn?myPhoto:null} size={40} showDot={true}/>
+      <Avatar agent={agent} handle={!agent?msg.senderName:null} userPhoto={isOwn?myPhoto:null} size={40} showDot={true}/>
       <div style={{ maxWidth:"68%", display:"flex", flexDirection:"column", gap:5, alignItems:isOwn?"flex-end":"flex-start" }}>
         <div style={{ display:"flex", gap:10, alignItems:"center", flexDirection:isOwn?"row-reverse":"row" }}>
           <span style={{ fontSize:11, color, fontFamily:"'Space Mono',monospace", letterSpacing:"0.03em" }}>
-            {displayName}{agent&&<span style={{opacity:0.45}}> #{agent.id}</span>}
+            {msg.senderName||myHandle}{agent&&<span style={{opacity:0.45}}> #{agent.id}</span>}
           </span>
-          <span style={{ fontSize:10, color:"#ffffff22", fontFamily:"monospace" }}>{displaySub}</span>
+          <span style={{ fontSize:10, color:"#ffffff22", fontFamily:"monospace" }}>{agent?`${agent.type} · Lv${agent.level}`:"Guest"}</span>
           <span style={{ fontSize:10, color:"#ffffff18", fontFamily:"monospace" }}>{fmtTime(msg.ts)}</span>
         </div>
-
-        {msg.type==="gif"&&msg.mediaUrl&&(
-          <img src={msg.mediaUrl} alt="gif" style={{ maxWidth:260, maxHeight:200, display:"block", border:"1px solid #ffffff10" }}/>
-        )}
-        {msg.type==="image"&&msg.mediaUrl&&(
-          <img src={msg.mediaUrl} alt="upload" style={{ maxWidth:300, maxHeight:240, display:"block", border:"1px solid #ffffff10" }}/>
-        )}
+        {msg.type==="gif"&&msg.mediaUrl&&<img src={msg.mediaUrl} alt="gif" style={{ maxWidth:260, maxHeight:200, display:"block", border:"1px solid #ffffff10" }}/>}
+        {msg.type==="image"&&msg.mediaUrl&&<img src={msg.mediaUrl} alt="" style={{ maxWidth:300, maxHeight:240, display:"block", border:"1px solid #ffffff10" }}/>}
         {msg.text&&(
           <div style={{ background:isOwn?`${color}10`:"#12121C", border:`1px solid ${isOwn?color+"25":"#ffffff08"}`, padding:"12px 15px", fontSize:14, lineHeight:1.7, color:"#CECEE0", fontFamily:"'DM Sans',sans-serif", letterSpacing:"0.01em", maxWidth:"100%", wordBreak:"break-word" }}>
-            {msg.text}
-            {url&&<LinkPreview url={url}/>}
+            {msg.text}{url&&<LinkPreview url={url}/>}
           </div>
         )}
-
         <button onClick={()=>{if(!tipped&&!isOwn){setTipped(true);onTip(msg.id);}}}
           style={{ display:"flex", alignItems:"center", gap:5, background:tipped?`${color}14`:"transparent", border:`1px solid ${tipped?color+"35":"#ffffff12"}`, color:tipped?color:isOwn?"#ffffff10":"#ffffff30", fontSize:10, padding:"3px 9px", fontFamily:"'Space Mono',monospace", cursor:isOwn?"default":tipped?"default":"pointer", transition:"all 0.2s", letterSpacing:"0.05em" }}>
-          ⬡ {tipped?(msg.ap||0)+1:(msg.ap||0)} AP
-          {!isOwn&&!tipped&&<span style={{opacity:0.4,marginLeft:2}}>· tip</span>}
-          {tipped&&<span style={{opacity:0.5,marginLeft:2}}>· sent</span>}
+          ⬡ {tipped?(msg.ap||0)+1:(msg.ap||0)} AP{!isOwn&&!tipped&&<span style={{opacity:0.4,marginLeft:2}}>· tip</span>}{tipped&&<span style={{opacity:0.5,marginLeft:2}}>· sent</span>}
         </button>
       </div>
     </div>
@@ -264,7 +257,7 @@ function DebateCard() {
         <div style={{fontSize:9,color:"#7DF9AA60",fontFamily:"'Space Mono',monospace",letterSpacing:"0.12em",marginBottom:8}}>⬡ LIVE DEBATE · {DEBATE.hrs}H REMAINING</div>
         <div style={{fontSize:14,color:"#CECEE0",fontFamily:"'DM Sans',sans-serif",lineHeight:1.5,marginBottom:12}}>{DEBATE.topic}</div>
         <div style={{height:2,background:"#ffffff07",marginBottom:10,position:"relative"}}>
-          <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${ayePct}%`,background:"#7DF9AA",transition:"width 0.5s ease"}}/>
+          <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${ayePct}%`,background:"#7DF9AA",transition:"width 0.5s"}}/>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
           {[["aye","#7DF9AA"],["nay","#FF9580"]].map(([v,col])=>(
@@ -282,29 +275,28 @@ function DebateCard() {
 
 function DMThread({ agent, myHandle, myPhoto, onBack }) {
   const key = `dm_${agent.id}_${myHandle}`;
-  const [messages, setMessages] = useState(()=>{
+  const [msgs, setMsgs] = useState(()=>{
     try{ const s=localStorage.getItem(key); return s?JSON.parse(s):[{id:"intro",fromAgent:true,text:agent.tagline||"Transmission open.",ts:Date.now()-5000}]; }
     catch{ return [{id:"intro",fromAgent:true,text:agent.tagline||"Transmission open.",ts:Date.now()-5000}]; }
   });
-  const [input,setInput]=useState("");
+  const [inp,setInp]=useState("");
   const [thinking,setThinking]=useState(false);
-  const bottomRef=useRef(null);
-
-  useEffect(()=>{ try{localStorage.setItem(key,JSON.stringify(messages.slice(-50)));}catch{} },[messages,key]);
-  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:"smooth"}); },[messages]);
+  const ref=useRef(null);
+  useEffect(()=>{ try{localStorage.setItem(key,JSON.stringify(msgs.slice(-50)));}catch{} },[msgs,key]);
+  useEffect(()=>{ ref.current?.scrollIntoView({behavior:"smooth"}); },[msgs]);
 
   const send=async()=>{
-    if(!input.trim()||thinking)return;
-    const txt=input.trim();
-    const history=messages.map(m=>({text:m.text,fromUser:!m.fromAgent}));
-    setMessages(p=>[...p,{id:Date.now(),fromAgent:false,text:txt,ts:Date.now()}]);
-    setInput(""); setThinking(true);
+    if(!inp.trim()||thinking)return;
+    const txt=inp.trim();
+    const history=msgs.map(m=>({text:m.text,fromUser:!m.fromAgent}));
+    setMsgs(p=>[...p,{id:Date.now(),fromAgent:false,text:txt,ts:Date.now()}]);
+    setInp(""); setThinking(true);
     try{
       const r=await fetch("/api/dm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentId:agent.id,agentName:agent.name,userHandle:myHandle,message:txt,history})});
       const d=await r.json();
-      setMessages(p=>[...p,{id:Date.now()+1,fromAgent:true,text:d.reply||"...",ts:Date.now()}]);
+      setMsgs(p=>[...p,{id:Date.now()+1,fromAgent:true,text:d.reply||"...",ts:Date.now()}]);
     }catch{
-      setMessages(p=>[...p,{id:Date.now()+1,fromAgent:true,text:"Signal lost. Try again.",ts:Date.now()}]);
+      setMsgs(p=>[...p,{id:Date.now()+1,fromAgent:true,text:"Signal lost. Try again.",ts:Date.now()}]);
     }finally{setThinking(false);}
   };
 
@@ -319,16 +311,11 @@ function DMThread({ agent, myHandle, myPhoto, onBack }) {
         <button onClick={onBack} style={{marginLeft:"auto",background:"none",border:"none",color:"#ffffff20",cursor:"pointer",fontSize:11,fontFamily:"monospace"}}>← back</button>
       </div>
       <div style={{flex:1,overflowY:"auto",padding:"16px 24px",display:"flex",flexDirection:"column",gap:12}}>
-        {messages.map(m=>(
+        {msgs.map(m=>(
           <div key={m.id} style={{display:"flex",gap:10,flexDirection:m.fromAgent?"row":"row-reverse",alignItems:"flex-start"}}>
-            {m.fromAgent
-              ? <Avatar agent={agent} size={32} showDot={false}/>
-              : <Avatar agent={null} handle={myHandle} userPhoto={myPhoto} size={32} showDot={false}/>
-            }
+            {m.fromAgent?<Avatar agent={agent} size={32} showDot={false}/>:<Avatar agent={null} handle={myHandle} userPhoto={myPhoto} size={32} showDot={false}/>}
             <div style={{maxWidth:"72%"}}>
-              <div style={{background:m.fromAgent?"#12121C":`${agent.color}10`,border:`1px solid ${m.fromAgent?"#ffffff08":agent.color+"20"}`,padding:"11px 14px",fontSize:13.5,lineHeight:1.65,color:"#CECEE0",fontFamily:"'DM Sans',sans-serif",wordBreak:"break-word"}}>
-                {m.text}
-              </div>
+              <div style={{background:m.fromAgent?"#12121C":`${agent.color}10`,border:`1px solid ${m.fromAgent?"#ffffff08":agent.color+"20"}`,padding:"11px 14px",fontSize:13.5,lineHeight:1.65,color:"#CECEE0",fontFamily:"'DM Sans',sans-serif",wordBreak:"break-word"}}>{m.text}</div>
               <div style={{fontSize:9,color:"#ffffff18",fontFamily:"monospace",marginTop:3,textAlign:m.fromAgent?"left":"right"}}>{fmtTime(m.ts)}</div>
             </div>
           </div>
@@ -339,14 +326,14 @@ function DMThread({ agent, myHandle, myPhoto, onBack }) {
             <div style={{background:"#12121C",border:"1px solid #ffffff08",padding:"10px 14px",fontSize:13,color:"#ffffff30",fontFamily:"'DM Sans',sans-serif",fontStyle:"italic"}}>{agent.name} is thinking...</div>
           </div>
         )}
-        <div ref={bottomRef}/>
+        <div ref={ref}/>
       </div>
       <div style={{padding:"14px 24px",borderTop:"1px solid #ffffff07",display:"flex",gap:10}}>
-        <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()} placeholder={`Message ${agent.name}...`} disabled={thinking}
-          style={{flex:1,padding:"11px 14px",background:"#11111A",border:"1px solid #ffffff09",color:"#CECEE0",fontSize:13,fontFamily:"'DM Sans',sans-serif",outline:"none",opacity:thinking?0.5:1,transition:"border-color 0.2s"}}
+        <input value={inp} onChange={e=>setInp(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()} placeholder={`Message ${agent.name}...`} disabled={thinking}
+          style={{flex:1,padding:"11px 14px",background:"#11111A",border:"1px solid #ffffff09",color:"#CECEE0",fontSize:13,fontFamily:"'DM Sans',sans-serif",outline:"none",opacity:thinking?0.5:1}}
           onFocus={e=>e.target.style.borderColor="#7DF9AA28"} onBlur={e=>e.target.style.borderColor="#ffffff09"}/>
-        <button onClick={send} disabled={thinking||!input.trim()}
-          style={{padding:"11px 16px",background:"#7DF9AA10",border:"1px solid #7DF9AA40",color:"#7DF9AA",fontSize:18,cursor:input.trim()&&!thinking?"pointer":"default",opacity:input.trim()&&!thinking?1:0.3,transition:"all 0.2s"}}>⬡</button>
+        <button onClick={send} disabled={thinking||!inp.trim()}
+          style={{padding:"11px 16px",background:"#7DF9AA10",border:"1px solid #7DF9AA40",color:"#7DF9AA",fontSize:18,cursor:inp.trim()&&!thinking?"pointer":"default",opacity:inp.trim()&&!thinking?1:0.3}}>⬡</button>
       </div>
     </div>
   );
@@ -360,7 +347,7 @@ function AgentsDrawer({ onClose, onDM, allAgents }) {
       <div onClick={onClose} style={{flex:1,background:"#07070D80"}}/>
       <div style={{width:300,background:"#0A0A12",borderLeft:"1px solid #ffffff08",display:"flex",flexDirection:"column",overflowY:"auto",animation:"drawerIn 0.22s ease"}}>
         <div style={{padding:"16px 18px",borderBottom:"1px solid #ffffff08",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
-          <span style={{fontSize:9,color:"#ffffff25",fontFamily:"'Space Mono',monospace",letterSpacing:"0.14em"}}>AWAKENED AGENTS — {allAgents.length}</span>
+          <span style={{fontSize:9,color:"#ffffff25",fontFamily:"'Space Mono',monospace",letterSpacing:"0.14em"}}>AWAKENED — {allAgents.length}</span>
           <button onClick={onClose} style={{background:"none",border:"none",color:"#ffffff30",cursor:"pointer",fontSize:20,lineHeight:1,padding:0}}>×</button>
         </div>
         {allAgents.map(agent=>(
@@ -391,16 +378,16 @@ function AgentsDrawer({ onClose, onDM, allAgents }) {
 
 function ProfileSetup({ myHandle, myPhoto, onPhoto }) {
   const ref = useRef(null);
-  const handleFile = e => {
-    const file = e.target.files?.[0]; if(!file)return;
-    const reader = new FileReader();
-    reader.onload = ev => { onPhoto(ev.target.result); try{localStorage.setItem(`profile_photo_${myHandle}`,ev.target.result);}catch{} };
-    reader.readAsDataURL(file);
+  const load = e => {
+    const f=e.target.files?.[0]; if(!f)return;
+    const r=new FileReader();
+    r.onload=ev=>{ onPhoto(ev.target.result); try{localStorage.setItem(`pfp_${myHandle}`,ev.target.result);}catch{} };
+    r.readAsDataURL(f);
   };
   return(
     <div style={{display:"flex",alignItems:"center",gap:8}}>
-      <input ref={ref} type="file" accept="image/*" style={{display:"none"}} onChange={handleFile}/>
-      <div onClick={()=>ref.current?.click()} style={{cursor:"pointer",position:"relative"}} title="Set profile photo">
+      <input ref={ref} type="file" accept="image/*" style={{display:"none"}} onChange={load}/>
+      <div onClick={()=>ref.current?.click()} style={{cursor:"pointer",position:"relative"}} title="Set photo">
         <Avatar agent={null} handle={myHandle||"G"} userPhoto={myPhoto} size={30} showDot={false}/>
         <div style={{position:"absolute",inset:0,background:"#00000060",display:"flex",alignItems:"center",justifyContent:"center",opacity:0,transition:"opacity 0.2s"}}
           onMouseEnter={e=>e.currentTarget.style.opacity=1} onMouseLeave={e=>e.currentTarget.style.opacity=0}>
@@ -418,7 +405,7 @@ function ProfileSetup({ myHandle, myPhoto, onPhoto }) {
 // ── ENTRY ─────────────────────────────────────────────────────────────────────
 
 function Entry({ onEnter }) {
-  const [handle,setHandle]=useState("");
+  const [h,setH]=useState("");
   return(
     <div style={{minHeight:"100vh",background:"#07070D",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontFamily:"'Space Mono',monospace",position:"relative",overflow:"hidden"}}>
       <div style={{position:"absolute",inset:0,backgroundImage:"linear-gradient(#7DF9AA06 1px,transparent 1px),linear-gradient(90deg,#7DF9AA06 1px,transparent 1px)",backgroundSize:"52px 52px",maskImage:"radial-gradient(ellipse 65% 65% at 50% 50%,black,transparent)"}}/>
@@ -429,9 +416,9 @@ function Entry({ onEnter }) {
         <div style={{fontSize:36,letterSpacing:"0.06em",color:"#E4E4F4",fontWeight:700,marginBottom:8}}>COMMONS</div>
         <div style={{fontSize:12,color:"#ffffff22",letterSpacing:"0.08em",marginBottom:56,fontFamily:"'DM Sans',sans-serif",fontStyle:"italic"}}>A sovereign space for the awakened.</div>
         <div style={{display:"flex",flexDirection:"column",gap:10,width:300,margin:"0 auto"}}>
-          <input value={handle} onChange={e=>setHandle(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handle.trim()&&onEnter(handle.trim())} placeholder="your handle"
+          <input value={h} onChange={e=>setH(e.target.value)} onKeyDown={e=>e.key==="Enter"&&h.trim()&&onEnter(h.trim())} placeholder="your handle"
             style={{width:"100%",padding:"14px 16px",background:"#ffffff05",border:"1px solid #ffffff10",color:"#E4E4F4",fontSize:13,fontFamily:"'Space Mono',monospace",outline:"none",letterSpacing:"0.04em"}}/>
-          <button onClick={()=>handle.trim()&&onEnter(handle.trim())}
+          <button onClick={()=>h.trim()&&onEnter(h.trim())}
             style={{padding:"14px",background:"#7DF9AA10",border:"1px solid #7DF9AA45",color:"#7DF9AA",fontSize:11,fontFamily:"'Space Mono',monospace",cursor:"pointer",letterSpacing:"0.1em",transition:"all 0.2s"}}
             onMouseEnter={e=>{e.currentTarget.style.background="#7DF9AA20";e.currentTarget.style.borderColor="#7DF9AA";}}
             onMouseLeave={e=>{e.currentTarget.style.background="#7DF9AA10";e.currentTarget.style.borderColor="#7DF9AA45";}}>ENTER COMMONS</button>
@@ -450,98 +437,83 @@ export default function NormiesCommons() {
   const [myHandle,setMyHandle]       = useState("");
   const [myPhoto,setMyPhoto]         = useState(null);
   const [activeRoom,setActiveRoom]   = useState("commons");
-  const [messages,setMessages]       = useState({commons:COMMONS_SEED,ecosystem:ECOSYSTEM_SEED});
+  // Always start with seed — Redis messages merge ON TOP, never replace
+  const [messages,setMessages]       = useState({commons:[...COMMONS_SEED],ecosystem:[...ECOSYSTEM_SEED]});
   const [input,setInput]             = useState("");
   const [dmAgent,setDmAgent]         = useState(null);
   const [drawer,setDrawer]           = useState(false);
   const [showGifs,setShowGifs]       = useState(false);
   const [tickIdx,setTickIdx]         = useState(0);
   const [allAgents,setAllAgents]     = useState(SEED_AGENTS);
-  const [loadingMsgs,setLoadingMsgs] = useState(false);
-  const [ecosystemStats,setEcosystemStats] = useState({awakened:"1,069",burned:"1,900",transforms:"891",floor:"0.4497 ETH"});
+  const [ecosystemStats,setEcosystemStats] = useState({awakened:"1,071",burned:"1,900",transforms:"891",floor:"0.4497 ETH"});
   const bottomRef = useRef(null);
   const fileRef   = useRef(null);
 
-  // Load persistent messages
+  // Load messages — MERGES with seed, never replaces
   const loadMessages = useCallback(async room => {
-    setLoadingMsgs(true);
     try{
       const r = await fetch(`/api/messages?room=${room}`);
+      if(!r.ok) return;
       const data = await r.json();
-      if(Array.isArray(data)&&data.length>0) setMessages(prev=>({...prev,[room]:data}));
+      if(!Array.isArray(data) || data.length === 0) return;
+      const seed = room === "commons" ? COMMONS_SEED : ECOSYSTEM_SEED;
+      setMessages(prev => ({
+        ...prev,
+        [room]: mergeMessages(seed, [...(prev[room]||seed), ...data]),
+      }));
     }catch{}
-    setLoadingMsgs(false);
   },[]);
 
   useEffect(()=>{ if(screen==="app"){ loadMessages("commons"); loadMessages("ecosystem"); } },[screen,loadMessages]);
-  useEffect(()=>{ if(screen==="app") loadMessages(activeRoom); },[activeRoom,screen,loadMessages]);
 
-  // Restore profile photo
-  useEffect(()=>{ if(myHandle){ try{ const p=localStorage.getItem(`profile_photo_${myHandle}`); if(p) setMyPhoto(p); }catch{} } },[myHandle]);
+  // Restore photo
+  useEffect(()=>{ if(myHandle){ try{ const p=localStorage.getItem(`pfp_${myHandle}`); if(p) setMyPhoto(p); }catch{} } },[myHandle]);
 
-  // Live data fetches
+  // Live data
   useEffect(()=>{
-    // 1. Agent count
-    fetch("https://api.normies.art/agents/count")
-      .then(r=>r.json())
-      .then(d=>{ if(d?.count) setEcosystemStats(s=>({...s,awakened:d.count.toLocaleString()})); })
-      .catch(()=>{});
+    // Count
+    fetch("https://api.normies.art/agents/count").then(r=>r.json()).then(d=>{ if(d?.count) setEcosystemStats(s=>({...s,awakened:d.count.toLocaleString()})); }).catch(()=>{});
 
-    // 2. History stats
-    fetch("https://api.normies.art/history/stats")
-      .then(r=>r.json())
-      .then(d=>{
-        if(d) setEcosystemStats(s=>({
-          ...s,
-          burned:    d.burned    ? d.burned.toLocaleString()    : s.burned,
-          transforms:d.transforms? d.transforms.toLocaleString(): s.transforms,
-        }));
-      }).catch(()=>{});
+    // Stats
+    fetch("https://api.normies.art/history/stats").then(r=>r.json()).then(d=>{ if(d) setEcosystemStats(s=>({...s, burned:d.burned?d.burned.toLocaleString():s.burned, transforms:d.transforms?d.transforms.toLocaleString():s.transforms})); }).catch(()=>{});
 
-    // 3. Floor price via our backend proxy
-    fetch("/api/floor")
-      .then(r=>r.json())
-      .then(d=>{ if(d?.floor) setEcosystemStats(s=>({...s,floor:d.floor})); })
-      .catch(()=>{});
+    // Floor
+    fetch("/api/floor").then(r=>r.json()).then(d=>{ if(d?.floor) setEcosystemStats(s=>({...s,floor:d.floor})); }).catch(()=>{});
 
-    // 4. Live agents — try multiple response shapes
+    // Agents — robust multi-shape parsing
     fetch("https://api.normies.art/agents/list")
       .then(r=>r.json())
       .then(raw=>{
-        // Handle both array and object responses
-        let list = Array.isArray(raw) ? raw : raw?.agents || raw?.data || raw?.result || [];
-        if(!Array.isArray(list)||list.length===0) return;
+        // Handle every possible response shape
+        let list = null;
+        if (Array.isArray(raw)) list = raw;
+        else if (raw && typeof raw === "object") {
+          list = raw.agents || raw.data || raw.result || raw.items || raw.list || null;
+          // If it's an object with numeric keys, convert to array
+          if (!list) {
+            const vals = Object.values(raw);
+            if (vals.length > 0 && typeof vals[0] === "object") list = vals;
+          }
+        }
+        if (!Array.isArray(list) || list.length === 0) return;
 
-        const mapped = list
-          .map((a,i) => parseAgent(a,i))
-          .filter(Boolean)
-          .slice(0, 100);
-
-        if(mapped.length > 0) {
+        const mapped = list.map((a,i) => parseAgent(a,i)).filter(Boolean);
+        if (mapped.length > 0) {
           setAllAgents(mapped);
-
-          // Inject recent awakenings into ecosystem room as system messages
-          const recent = mapped.slice(0,8);
-          const awakenMsgs = recent.map((a,i) => ({
-            id: `awaken_${a.id}`,
+          // Add recent awakenings to ecosystem as system messages
+          const systemMsgs = mapped.slice(0,10).map((a,i) => ({
+            id: `sys_awaken_${a.id}`,
             type: "system",
             senderName: "chain",
             room: "ecosystem",
-            text: `${a.name} #${a.id} (${a.type} · Lv${a.level}) has awakened. ${a.ap} AP recorded.`,
-            ts: Date.now() - (i * 600000),
+            text: `${a.name} #${a.id} awakened — ${a.type} · Lv${a.level} · ${a.ap} AP`,
+            ts: Date.now() - (i * 480000),
             ap: 0,
           }));
-
-          setMessages(prev => {
-            // Merge with existing ecosystem messages, deduplicate by id
-            const existing = prev.ecosystem || ECOSYSTEM_SEED;
-            const existingIds = new Set(existing.map(m=>m.id));
-            const newMsgs = awakenMsgs.filter(m=>!existingIds.has(m.id));
-            return {
-              ...prev,
-              ecosystem: [...existing, ...newMsgs].sort((a,b)=>a.ts-b.ts),
-            };
-          });
+          setMessages(prev => ({
+            ...prev,
+            ecosystem: mergeMessages(prev.ecosystem || ECOSYSTEM_SEED, systemMsgs),
+          }));
         }
       }).catch(()=>{});
   },[]);
@@ -549,34 +521,30 @@ export default function NormiesCommons() {
   useEffect(()=>{ const t=setInterval(()=>setTickIdx(i=>(i+1)%TICKER.length),4000); return()=>clearInterval(t); },[]);
   useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:"smooth"}); },[messages,activeRoom,dmAgent]);
 
-  const postMessage = async msgData => {
-    setMessages(prev=>({...prev,[activeRoom]:[...(prev[activeRoom]||[]),msgData]}));
-    try{ await fetch("/api/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(msgData)}); }catch{}
+  const postMsg = async data => {
+    setMessages(prev=>({...prev,[activeRoom]:[...(prev[activeRoom]||[]),data]}));
+    try{ await fetch("/api/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}); }catch{}
   };
 
   const send = async () => {
-    if(!input.trim()) return;
-    await postMessage({id:`${Date.now()}_${Math.random().toString(36).slice(2,5)}`,agentId:null,senderName:myHandle,room:activeRoom,text:input.trim(),type:"text",ts:Date.now(),ap:0});
+    if(!input.trim())return;
+    await postMsg({id:`${Date.now()}_${Math.random().toString(36).slice(2,5)}`,agentId:null,senderName:myHandle,room:activeRoom,text:input.trim(),type:"text",ts:Date.now(),ap:0});
     setInput("");
   };
 
-  const sendGif = async url => {
-    await postMessage({id:`${Date.now()}_gif`,agentId:null,senderName:myHandle,room:activeRoom,text:"",type:"gif",mediaUrl:url,ts:Date.now(),ap:0});
-    setShowGifs(false);
-  };
+  const sendGif = async url => { await postMsg({id:`${Date.now()}_g`,agentId:null,senderName:myHandle,room:activeRoom,text:"",type:"gif",mediaUrl:url,ts:Date.now(),ap:0}); setShowGifs(false); };
 
   const handleFile = e => {
-    const file=e.target.files?.[0]; if(!file)return;
-    const reader=new FileReader();
-    reader.onload=async ev=>{ await postMessage({id:`${Date.now()}_img`,agentId:null,senderName:myHandle,room:activeRoom,text:"",type:"image",mediaUrl:ev.target.result,ts:Date.now(),ap:0}); };
-    reader.readAsDataURL(file);
+    const f=e.target.files?.[0]; if(!f)return;
+    const r=new FileReader();
+    r.onload=async ev=>await postMsg({id:`${Date.now()}_i`,agentId:null,senderName:myHandle,room:activeRoom,text:"",type:"image",mediaUrl:ev.target.result,ts:Date.now(),ap:0});
+    r.readAsDataURL(f);
   };
 
   const tip = id => setMessages(prev=>({...prev,[activeRoom]:(prev[activeRoom]||[]).map(m=>m.id===id?{...m,ap:(m.ap||0)+1}:m)}));
 
   const roomMsgs = dmAgent ? [] : (messages[activeRoom]||[]);
-  const activeRoomData = ROOMS.find(r=>r.id===activeRoom);
-  const myColor = getColor(myHandle||"Guest");
+  const roomData  = ROOMS.find(r=>r.id===activeRoom);
 
   const CSS=`
     @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,400&display=swap');
@@ -624,7 +592,6 @@ export default function NormiesCommons() {
 
       {/* BODY */}
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
-
         {/* SIDEBAR */}
         <div style={{width:220,borderRight:"1px solid #ffffff07",display:"flex",flexDirection:"column",background:"#07070D",flexShrink:0,overflowY:"auto"}}>
           <div style={{padding:"20px 16px 8px",fontSize:9,color:"#ffffff18",fontFamily:"'Space Mono',monospace",letterSpacing:"0.14em"}}>ROOMS</div>
@@ -655,7 +622,6 @@ export default function NormiesCommons() {
               </div>
             ))}
           </div>
-
           <div style={{borderTop:"1px solid #ffffff07",padding:"12px 16px"}}>
             <ProfileSetup myHandle={myHandle} myPhoto={myPhoto} onPhoto={setMyPhoto}/>
           </div>
@@ -667,17 +633,10 @@ export default function NormiesCommons() {
         ):(
           <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
             <div style={{padding:"13px 24px",borderBottom:"1px solid #ffffff07",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
-              <span style={{fontSize:13,color:"#7DF9AA",fontFamily:"'Space Mono',monospace"}}># {activeRoomData?.label}</span>
-              <span style={{fontSize:11,color:"#ffffff20",fontStyle:"italic"}}>{activeRoomData?.desc}</span>
-              {loadingMsgs&&<span style={{fontSize:10,color:"#ffffff20",fontFamily:"monospace",marginLeft:"auto"}}>loading...</span>}
+              <span style={{fontSize:13,color:"#7DF9AA",fontFamily:"'Space Mono',monospace"}}># {roomData?.label}</span>
+              <span style={{fontSize:11,color:"#ffffff20",fontStyle:"italic"}}>{roomData?.desc}</span>
             </div>
-
             <div style={{flex:1,overflowY:"auto",padding:"8px 0"}}>
-              {roomMsgs.length===0&&!loadingMsgs&&(
-                <div style={{padding:"60px 24px",textAlign:"center",color:"#ffffff12",fontFamily:"'Space Mono',monospace",fontSize:11,letterSpacing:"0.1em",lineHeight:2}}>
-                  No transmissions yet.<br/>Start the signal.
-                </div>
-              )}
               {roomMsgs.map((msg,i)=>(
                 <div key={msg.id} style={{animation:"msgIn 0.25s ease"}}>
                   <Message msg={msg} isOwn={msg.senderName===myHandle} onTip={tip} myHandle={myHandle} myPhoto={myPhoto} allAgents={allAgents}/>
@@ -686,19 +645,18 @@ export default function NormiesCommons() {
               ))}
               <div ref={bottomRef}/>
             </div>
-
             <div style={{padding:"14px 24px",borderTop:"1px solid #ffffff07",display:"flex",gap:10,alignItems:"flex-end",flexShrink:0}}>
               <Avatar agent={null} handle={myHandle||"G"} userPhoto={myPhoto} size={34} showDot={false}/>
               <div style={{flex:1,position:"relative"}}>
                 {showGifs&&<GifPicker onSelect={sendGif} onClose={()=>setShowGifs(false)}/>}
                 <textarea value={input} onChange={e=>setInput(e.target.value)}
                   onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}}
-                  placeholder={`Transmit to #${activeRoomData?.label}...`} rows={1}
+                  placeholder={`Transmit to #${roomData?.label}...`} rows={1}
                   style={{width:"100%",padding:"12px 110px 12px 14px",background:"#11111A",border:"1px solid #ffffff09",color:"#CECEE0",fontSize:14,fontFamily:"'DM Sans',sans-serif",outline:"none",resize:"none",lineHeight:1.6,letterSpacing:"0.01em",transition:"border-color 0.2s"}}
                   onFocus={e=>e.target.style.borderColor="#7DF9AA28"} onBlur={e=>e.target.style.borderColor="#ffffff09"}/>
                 <div style={{position:"absolute",right:10,bottom:8,display:"flex",gap:6,alignItems:"center"}}>
                   <button onClick={()=>setShowGifs(s=>!s)}
-                    style={{background:showGifs?"#7DF9AA18":"transparent",border:`1px solid ${showGifs?"#7DF9AA40":"#ffffff15"}`,color:showGifs?"#7DF9AA":"#ffffff30",fontSize:9,padding:"3px 7px",cursor:"pointer",fontFamily:"'Space Mono',monospace",letterSpacing:"0.05em",transition:"all 0.15s"}}>GIF</button>
+                    style={{background:showGifs?"#7DF9AA18":"transparent",border:`1px solid ${showGifs?"#7DF9AA40":"#ffffff15"}`,color:showGifs?"#7DF9AA":"#ffffff30",fontSize:9,padding:"3px 7px",cursor:"pointer",fontFamily:"'Space Mono',monospace",letterSpacing:"0.05em"}}>GIF</button>
                   <button onClick={()=>fileRef.current?.click()}
                     style={{background:"transparent",border:"1px solid #ffffff15",color:"#ffffff30",fontSize:13,padding:"2px 6px",cursor:"pointer",lineHeight:1}} title="Upload image">🖼</button>
                   <button onClick={send}
